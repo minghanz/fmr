@@ -1,0 +1,5 @@
+num_points: 10000
+mag_deg: 45
+random_deg: true
+mag_trans: 0.5
+random_trans: true

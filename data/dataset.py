@@ -19,6 +19,8 @@ import se_math.so3 as so3
 import se_math.mesh as mesh
 import se_math.transforms as transforms
 
+import yaml
+
 """
 The following three functions are defined for getting data from specific database 
 """
@@ -65,6 +67,15 @@ def glob_dataset(root, class_to_idx, ptns):
     return samples
 
 
+def T44_from_txt(txt_path):
+    with open(txt_path) as f:
+        lines = f.readlines()
+        linesmat = lines[1:5]
+        mat = [[float(x) for x in line.split()] for line in linesmat]
+        mat = np.array(mat)
+        # print(mat.shape, mat) #4*4
+    return mat
+
 # a general class for obtaining the 3D point cloud data from a database
 class PointCloudDataset(torch.utils.data.Dataset):
     """ glob ${rootdir}/${classes}/${pattern}
@@ -104,11 +115,23 @@ class PointCloudDataset(torch.utils.data.Dataset):
         :return:
         """
         path, target = self.samples[index]
-        sample = self.fileloader(path)
+        try:
+            sample = self.fileloader(path)
+        except Exception as e:
+            print(e)
+            return self.__getitem__(index+1)
+
+        ### the mat is only used in duo_mode (see TransformedDataset)
+        mat = None
+        txt = path.replace('.ply', '.info.txt')
+        if os.path.exists(txt):
+            mat = T44_from_txt(txt)
+            mat = torch.from_numpy(mat).to(dtype=torch.float)
+
         if self.transform is not None:
             sample = self.transform(sample)
 
-        return sample, target
+        return sample, target, mat
 
     def split(self, rate):
         """ dateset -> dataset1, dataset2. s.t.
@@ -182,37 +205,58 @@ class Scene7(PointCloudDataset):
 
 
 class TransformedDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset, rigid_transform, source_modifier=None, template_modifier=None):
+    # def __init__(self, dataset, rigid_transform, source_modifier=None, template_modifier=None, resampling=False, duo_mode=False):
+    def __init__(self, dataset, rigid_transform, source_modifier=None, template_modifier=None, duo_mode=False):
         self.dataset = dataset
         self.rigid_transform = rigid_transform
         self.source_modifier = source_modifier
         self.template_modifier = template_modifier
 
+        # self.rigid_transform_both = transforms.RandomTransformSE3(180, True, 0)
+        # self.resampling = resampling
+        self.duo_mode = duo_mode
+
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, index):
-        pm, _ = self.dataset[index]
-        if self.source_modifier is not None:
-            p_ = self.source_modifier(pm)
-            p1 = self.rigid_transform(p_)
-        else:
-            p1 = self.rigid_transform(pm)
-        igt = self.rigid_transform.igt
+        pm, _, mat1 = self.dataset[index]
+
+        ### template (target)
+        p0 = pm
+        if self.duo_mode:
+            if index < len(self) - 1:
+                p0, _, mat0 = self.dataset[index+1]
+            else:
+                p0, _, mat0 = self.dataset[index-1]
+            assert mat1 is not None and mat0 is not None, f"{mat0},{mat1}"
+            mat01 = torch.matmul(torch.inverse(mat1), mat0)
+            p0 = torch.matmul(mat01[:3, :3], p0.transpose(0,1)) + mat01[:3, [3]]
+            p0 = p0.transpose(0,1)
 
         if self.template_modifier is not None:
-            p0 = self.template_modifier(pm)
-        else:
-            p0 = pm
+            p0 = self.template_modifier(p0)
+                
+        ### source
+        p1 = pm
+        if self.source_modifier is not None:
+            p1 = self.source_modifier(p1)
 
-        # p0: template, p1: source, igt: transform matrix from p0 to p1
+        p1 = self.rigid_transform(p1)
+        igt = self.rigid_transform.igt
+
+        # p0: template, p1: source, igt: transform matrix from p0 to p1 (T10)
+        ### The official result we want at the end is T01 (the transformation applied on source p1 to align with target p0). 
+        ### Therefore this igt (T10) is for conveniently evaluating the error of T01 by multiplication. 
         return p0, p1, igt
 
 
 class TransformedFixedDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset, perturbation):
+    def __init__(self, dataset, perturbation, source_modifier=None, template_modifier=None):
         self.dataset = dataset
         self.perturbation = numpy.array(perturbation)  # twist (len(dataset), 6)
+        self.source_modifier = source_modifier
+        self.template_modifier = template_modifier
 
     def do_transform(self, p0, x):
         # p0: [N, 3]
@@ -234,10 +278,19 @@ class TransformedFixedDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         twist = torch.from_numpy(numpy.array(self.perturbation[index])).contiguous().view(1, 6)
-        pm, _ = self.dataset[index]
+        pm, _, _ = self.dataset[index]
         x = twist.to(pm)
-        p1, igt = self.do_transform(pm, x)
+
+        p1 = pm
+        if self.source_modifier is not None:
+            p1 = self.source_modifier(p1)
+            
+        p1, igt = self.do_transform(p1, x)
+
         p0 = pm
+        if self.template_modifier is not None:
+            p0 = self.template_modifier(p0)
+
         # p0: template, p1: source, igt: transform matrix from p0 to p1
         return p0, p1, igt
 
@@ -251,9 +304,43 @@ def get_categories(args):
         cinfo = (categories, c_to_idx)
     return cinfo
 
+def save_transforms(tf_dict, path_out):
+    tfstr_dict = dict()
+    for key in tf_dict:
+        tfstr_dict[key] = [repr(x) for x in tf_dict[key]]
+    dir = os.path.dirname(path_out)
+    if not os.path.exists(dir):
+        os.makedirs(dir)
+    with open(path_out, 'w') as f:
+        yaml.dump(tfstr_dict, f)
+    return
+
+def get_transforms(cfg_yaml, params):
+    ### params is used in eval()
+    with open(cfg_yaml) as f:
+        tfstr_dict = yaml.safe_load(f)
+    tf_dict = dict()
+    local_scope = locals()
+    global_scope = globals()
+    global_scope.update(local_scope)
+    for key in tfstr_dict:
+        tf_dict[key] = [eval("transforms."+x, global_scope) for x in tfstr_dict[key]]
+    return tfstr_dict, tf_dict
+
+# def get_params(cfg_yaml):
+#     with open(cfg_yaml) as f:
+#         params = yaml.safe_load(f)
+#     return params
 
 # global dataset function, could call to get dataset
-def get_datasets(args):
+def get_datasets(args, params):
+    tfstr_dict, tf_dict = get_transforms(args.tf_cfg, params)
+    transform_shared = torchvision.transforms.Compose(tf_dict["shared"])
+    transform_source = torchvision.transforms.Compose(tf_dict["source"])
+    transform_template = torchvision.transforms.Compose(tf_dict["target"])
+    tf_savepath = args.outfile+"_tfs.yaml"
+    save_transforms(tf_dict, tf_savepath)
+
     if args.dataset_type == 'modelnet':
         # download modelnet40 for training
         BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -268,37 +355,60 @@ def get_datasets(args):
             exit(
                 "Please download ModelNET40 and put it in the data folder, the download link is http://modelnet.cs.princeton.edu/ModelNet40.zip")
 
+        # if args.mode == 'train':
+        # # if True:
+        #     # set path and category file for training
+        #     args.dataset_path = './data/ModelNet40'
+        #     args.categoryfile = './data/categories/modelnet40_half1.txt'      # 1202 models
+        #     # args.categoryfile = './data/categories/modelnet40.txt'      # 2468 models
+        #     cinfo = get_categories(args)
+        #     transform = torchvision.transforms.Compose([ \
+        #         transforms.Mesh2Points(), \
+        #         transforms.OnUnitCube(), \
+        #         transforms.Resampler(args.num_points), \
+        #         ])
+        #     traindata = ModelNet(args.dataset_path, train=1, transform=transform, classinfo=cinfo, is_uniform_sampling=args.uniformsampling)
+        #     testdata = ModelNet(args.dataset_path, train=0, transform=transform, classinfo=cinfo, is_uniform_sampling=args.uniformsampling)
+        #     mag_randomly = False #True
+        #     trainset = TransformedDataset(traindata, transforms.RandomTransformSE3(args.mag, mag_randomly, args.mag_trans), resampling=args.resampling)
+        #     testset = TransformedDataset(testdata, transforms.RandomTransformSE3(args.mag, mag_randomly, args.mag_trans), resampling=args.resampling)
+        #     # return trainset, testset
+        #     return testset
+
         if args.mode == 'train':
             # set path and category file for training
             args.dataset_path = './data/ModelNet40'
-            args.categoryfile = './data/categories/modelnet40_half1.txt'
+            args.categoryfile = './data/categories/modelnet40_half1.txt'      # 1202 models
+            # args.categoryfile = './data/categories/modelnet40.txt'      # 2468 models
             cinfo = get_categories(args)
-            transform = torchvision.transforms.Compose([ \
-                transforms.Mesh2Points(), \
-                transforms.OnUnitCube(), \
-                transforms.Resampler(args.num_points), \
-                ])
-            traindata = ModelNet(args.dataset_path, train=1, transform=transform, classinfo=cinfo, is_uniform_sampling=args.uniformsampling)
-            testdata = ModelNet(args.dataset_path, train=0, transform=transform, classinfo=cinfo, is_uniform_sampling=args.uniformsampling)
-            mag_randomly = True
-            trainset = TransformedDataset(traindata, transforms.RandomTransformSE3(args.mag, mag_randomly))
-            testset = TransformedDataset(testdata, transforms.RandomTransformSE3(args.mag, mag_randomly))
+
+            traindata = ModelNet(args.dataset_path, train=1, transform=transform_shared, classinfo=cinfo, is_uniform_sampling=params['uniformsampling'])
+            testdata = ModelNet(args.dataset_path, train=0, transform=transform_shared, classinfo=cinfo, is_uniform_sampling=params['uniformsampling'])
+            
+            trainset = TransformedDataset(traindata, transforms.RandomTransformSE3(params['mag_deg'], params['mag_trans'], params['random_deg'], params['random_trans']), \
+                        transform_source, transform_template)
+            testset = TransformedDataset(testdata, transforms.RandomTransformSE3(params['mag_deg'], params['mag_trans'], params['random_deg'], params['random_trans']), \
+                        transform_source, transform_template)
             return trainset, testset
         else:
             # set path and category file for test
             args.dataset_path = './data/ModelNet40'
             args.categoryfile = './data/categories/modelnet40_half1.txt'
+            # args.categoryfile = './data/categories/modelnet40.txt'
             cinfo = get_categories(args)
 
             # get the ground truth perturbation
-            perturbations = None
+            fixed_rigid_transform = False
             if args.perturbations:
                 perturbations = numpy.loadtxt(args.perturbations, delimiter=',')
+                fixed_rigid_transform = True
 
-            transform = torchvision.transforms.Compose([transforms.Mesh2Points(), transforms.OnUnitCube()])
-
-            testdata = ModelNet(args.dataset_path, train=0, transform=transform, classinfo=cinfo, is_uniform_sampling=args.uniformsampling)
-            testset = TransformedFixedDataset(testdata, perturbations)
+            testdata = ModelNet(args.dataset_path, train=0, transform=transform_shared, classinfo=cinfo, is_uniform_sampling=params['uniformsampling'])
+            if fixed_rigid_transform:
+                testset = TransformedFixedDataset(testdata, perturbations, transform_source, transform_template)
+            else:
+                testset = TransformedDataset(testdata, transforms.RandomTransformSE3(params['mag_deg'], params['mag_trans'], params['random_deg'], params['random_trans']), \
+                            transform_source, transform_template)
             return testset
 
     elif args.dataset_type == '7scene':
@@ -308,17 +418,13 @@ def get_datasets(args):
             args.categoryfile = './data/categories/7scene_train.txt'
             cinfo = get_categories(args)
 
-            transform = torchvision.transforms.Compose([ \
-                transforms.Mesh2Points(), \
-                transforms.OnUnitCube(), \
-                transforms.Resampler(args.num_points)])
-
-            dataset = Scene7(args.dataset_path, transform=transform, classinfo=cinfo)
+            dataset = Scene7(args.dataset_path, transform=transform_shared, classinfo=cinfo)
             traindata, testdata = dataset.split(0.8)
 
-            mag_randomly = True
-            trainset = TransformedDataset(traindata, transforms.RandomTransformSE3(args.mag, mag_randomly))
-            testset = TransformedDataset(testdata, transforms.RandomTransformSE3(args.mag, mag_randomly))
+            trainset = TransformedDataset(traindata, transforms.RandomTransformSE3(params['mag_deg'], params['mag_trans'], params['random_deg'], params['random_trans']), \
+                        transform_source, transform_template, duo_mode=args.duo_mode)
+            testset = TransformedDataset(testdata, transforms.RandomTransformSE3(params['mag_deg'], params['mag_trans'], params['random_deg'], params['random_trans']), \
+                        transform_source, transform_template, duo_mode=args.duo_mode)
             return trainset, testset
         else:
             # set path and category file for testing
@@ -326,15 +432,9 @@ def get_datasets(args):
             args.categoryfile = './data/categories/7scene_test.txt'
             cinfo = get_categories(args)
 
-            transform = torchvision.transforms.Compose([ \
-                transforms.Mesh2Points(), \
-                transforms.OnUnitCube(), \
-                transforms.Resampler(10000), \
-                ])
-
-            testdata = Scene7(args.dataset_path, transform=transform, classinfo=cinfo)
+            testdata = Scene7(args.dataset_path, transform=transform_shared, classinfo=cinfo)
 
             # randomly generate transformation matrix
-            mag_randomly = True
-            testset = TransformedDataset(testdata, transforms.RandomTransformSE3(0.8, mag_randomly))
+            testset = TransformedDataset(testdata, transforms.RandomTransformSE3(params['mag_deg'], params['mag_trans'], params['random_deg'], params['random_trans']), \
+                        transform_source, transform_template, duo_mode=args.duo_mode)
             return testset

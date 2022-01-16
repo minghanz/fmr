@@ -1,0 +1,8 @@
+shared:
+  - Mesh2Points()
+  - OnUnitCube()
+  - RandomRotator()
+source:
+  - Resampler(params['num_points'])
+target:
+  - Resampler(params['num_points'])

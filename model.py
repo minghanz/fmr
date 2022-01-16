@@ -9,7 +9,59 @@ from random import sample
 
 import se_math.se3 as se3
 import se_math.invmat as invmat
+from tqdm import tqdm
 
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+def visualize_pointcloud(points, normals=None,
+                         out_file=None, show=False, 
+                         points2=None, info=None, 
+                         c1=None, c2=None, cm1='viridis', cm2='viridis', s1=5, s2=5):
+    r''' Visualizes point cloud data.
+
+    Args:
+        points (tensor): point data
+        normals (tensor): normal data (if existing)
+        out_file (string): output file
+        show (bool): whether the plot should be shown
+    '''
+    # Use numpy
+    points = np.asarray(points)
+    # Create plot
+    fig = plt.figure()
+    ax = fig.gca(projection=Axes3D.name)
+    if c1 is not None:
+        cmap1 = plt.get_cmap(cm1)   # viridis, magma
+        ax.scatter(points[:, 2], points[:, 0], points[:, 1], s=s1, c=c1, cmap=cmap1)
+    else:
+        ax.scatter(points[:, 2], points[:, 0], points[:, 1], s=s1)
+    if points2 is not None:
+        if c2 is not None:
+            cmap2 = plt.get_cmap(cm2)
+            ax.scatter(points2[:, 2], points2[:, 0], points2[:, 1], s=s2, c=c2, cmap=cmap2, marker='^')
+        else:
+            ax.scatter(points2[:, 2], points2[:, 0], points2[:, 1], 'r', s=s2)
+    if normals is not None:
+        ax.quiver(
+            points[:, 2], points[:, 0], points[:, 1],
+            normals[:, 2], normals[:, 0], normals[:, 1],
+            length=0.8, color='gray', linewidth=0.8
+        )
+    ax.set_xlabel('Z')
+    ax.set_ylabel('X')
+    ax.set_zlabel('Y')
+    ax.set_xlim(-0.5, 0.5)
+    ax.set_ylim(-0.5, 0.5)
+    ax.set_zlim(-0.5, 0.5)
+    ax.view_init(elev=30, azim=45)
+    if info is not None:
+        plt.title("{}".format(info))
+
+    if out_file is not None:
+        plt.savefig(out_file)
+    if show:
+        plt.show()
+    plt.close(fig)
 
 # a global function to flatten a feature
 def flatten(x):
@@ -182,6 +234,7 @@ class SolveRegistration(torch.nn.Module):
             if p1_zero_mean:
                 est_g = est_g.bmm(a1.to(est_g))
             self.g = est_g
+            ### g: T01 (apply on 1 to align with 0)
 
             est_gs = self.g_series  # [M, B, 4, 4]
             if p0_zero_mean:
@@ -338,11 +391,16 @@ class SolveRegistration(torch.nn.Module):
 
 # main algorithm class
 class FMRTrain:
-    def __init__(self, dim_k, num_points, train_type):
-        self.dim_k = dim_k
-        self.num_points = num_points
-        self.max_iter = 10  # max iteration time for IC algorithm
-        self._loss_type = train_type  # 0: unsupervised, 1: semi-supervised see. self.compute_loss()
+    # def __init__(self, dim_k, num_points, train_type):
+    def __init__(self, args, params):
+        self.dim_k = args.dim_k
+        self.num_points = params['num_points']
+        self.max_iter_train = args.max_iter_train
+        self.max_iter_val = args.max_iter_val
+        # self.max_iter = 10  # max iteration time for IC algorithm
+        self._loss_type = args.train_type  # 0: unsupervised, 1: semi-supervised see. self.compute_loss()
+        if self._loss_type != 0:
+            assert self.max_iter_train > 0, self.max_iter_train
 
     def create_model(self):
         # Encoder network: extract feature for every point. Nx1024
@@ -353,19 +411,24 @@ class FMRTrain:
         fmr_solver = SolveRegistration(ptnet, decoder,isTest=False)
         return fmr_solver
 
-    def compute_loss(self, solver, data, device):
+    def compute_loss(self, solver, data, device, train_mode=True):
         p0, p1, igt = data
         p0 = p0.to(device)  # template
         p1 = p1.to(device)  # source
         igt = igt.to(device)  # igt: p0 -> p1
-        r, loss_ende = solver.estimate_t(p0, p1, self.max_iter)
-        loss_r = solver.rsq(r)
-        est_g = solver.g
-        loss_g = solver.comp(est_g, igt)
+        max_iter = self.max_iter_train if train_mode else self.max_iter_val
+        r, loss_ende = solver.estimate_t(p0, p1, max_iter)
 
+        loss_dict = dict(loss_ende=loss_ende)
         # unsupervised learning, set max_iter=0
-        if self.max_iter == 0:
-            return loss_ende
+        if max_iter == 0:
+            return loss_ende, loss_dict     # autoencoder loss
+
+        loss_r = solver.rsq(r)              # feature residual after registration
+        est_g = solver.g
+        loss_g = solver.comp(est_g, igt)    # pose residual
+
+        loss_dict.update(loss_feat=loss_r, loss_pose=loss_g)
 
         # semi-supervised learning, set max_iter>0
         if self._loss_type == 0:
@@ -376,119 +439,217 @@ class FMRTrain:
             loss = loss_r + loss_g
         else:
             loss = loss_g
-        return loss
+        return loss, loss_dict
 
     def train(self, model, trainloader, optimizer, device):
         model.train()
 
         Debug = True
         total_loss = 0
+        total_loss_dict = dict()
+        # count = 0
         if Debug:
             epe = 0
-            count = 0
-            count_mid = 9
-        for i, data in enumerate(trainloader):
-            loss = self.compute_loss(model, data, device)
+            count_mid = 10
+        pbar = tqdm(trainloader)
+        for i, data in enumerate(pbar):
+            loss, loss_dict = self.compute_loss(model, data, device, True)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             loss_item = loss.item()
             total_loss += loss_item
+            for key in loss_dict:
+                if key not in total_loss_dict:
+                    total_loss_dict[key] = 0
+                total_loss_dict[key] += loss_dict[key].item()
+
             if Debug:
                 epe += loss_item
-                if count % 10 == 0:
-                    print('i=%d, fmr_loss=%f ' % (i, float(epe) / (count_mid + 1)))
+                if (i+1) % count_mid == 0:
+                    # print('i=%d, fmr_loss=%f ' % (i, float(epe) / (count_mid + 1)))
+                    pbar.set_description('train: %d, fmr_loss=%.4f' % (i+1, float(epe) / count_mid))
                     epe = 0.0
-            count += 1
+            # count += 1
+        count = i + 1
         ave_loss = float(total_loss) / count
-        return ave_loss
+        for key in total_loss_dict:
+            total_loss_dict[key] = float(total_loss_dict[key]) / count
+        return ave_loss, total_loss_dict
 
     def validate(self, model, testloader, device):
         model.eval()
+        Debug = True
         vloss = 0.0
-        count = 0
+        # count = 0
+        total_loss_dict = dict()
+        if Debug:
+            epe = 0
+            count_mid = 10
         with torch.no_grad():
-            for i, data in enumerate(testloader):
-                loss_net = self.compute_loss(model, data, device)
+            pbar = tqdm(testloader)
+            for i, data in enumerate(pbar):
+                loss_net, loss_dict = self.compute_loss(model, data, device, False)
                 vloss += loss_net.item()
-                count += 1
+                for key in loss_dict:
+                    if key not in total_loss_dict:
+                        total_loss_dict[key] = 0
+                    total_loss_dict[key] += loss_dict[key].item()
 
+                if Debug:
+                    epe += loss_net.item()
+                    if (i+1) % count_mid == 0:
+                        pbar.set_description('val: %d, fmr_loss=%.4f' % (i+1, float(epe) / count_mid))
+                        epe = 0.0
+                
+                # count += 1
+        count = i + 1
         ave_vloss = float(vloss) / count
-        return ave_vloss
+        for key in total_loss_dict:
+            total_loss_dict[key] = float(total_loss_dict[key]) / count
+        return ave_vloss, total_loss_dict
 
+class MetricTracker:
+    def __init__(self, keys, angle_180=True) -> None:
+        self.d = dict(num=0)
+        for k in keys:
+            self.d[k] = 0
+
+        self.angle_180 = angle_180
+        if self.angle_180:
+            assert 'angle' in self.d, self.d
+            self.d['num_90-'] = 0
+            self.d['num_90+'] = 0
+            self.d['angle180'] = 0
+            
+    def update(self, d):
+        for k in d:
+            self.d[k] += d[k]
+        self.d['num']+= 1
+
+        if self.angle_180:
+            angle_diff_90m = d['angle']
+            angle_diff_90p = 180-d['angle']
+            if angle_diff_90m < angle_diff_90p:
+                self.d['angle180'] += angle_diff_90m
+                self.d['num_90-'] += 1
+            else:
+                self.d['angle180'] += angle_diff_90p
+                self.d['num_90+'] += 1
+        return
+    def summary(self):
+        for k in self.d:
+            if k != 'num':
+                self.d[k] /= self.d['num']
+        return self.d.copy()
 
 class FMRTest:
-    def __init__(self, args):
-        self.filename = args.outfile
+    def __init__(self, args, params):
+        self.filename = args.outfile + ".csv"
         self.dim_k = args.dim_k
-        self.max_iter = 10  # max iteration time for IC algorithm
+        self.num_points = params['num_points']
+        self.max_iter = args.max_iter_val #10  # max iteration time for IC algorithm
         self._loss_type = 1  # see. self.compute_loss()
 
+        # self.noise = args.noise
+        # self.density = args.density
     def create_model(self):
         # Encoder network: extract feature for every point. Nx1024
         ptnet = PointNet(dim_k=self.dim_k)
         # Decoder network: decode the feature into points, not used during the evaluation
-        decoder = Decoder()
+        decoder = Decoder(num_points=self.num_points)
         # feature-metric ergistration (fmr) algorithm: estimate the transformation T
         fmr_solver = SolveRegistration(ptnet, decoder, isTest=True)
         return fmr_solver
 
     def evaluate(self, solver, testloader, device):
         solver.eval()
+        metric_tracker = MetricTracker(['angle', 'trans'])
+        f_err = open(self.filename[:-4]+"_err.txt", "w")
+        
         with open(self.filename, 'w') as fout:
             self.eval_1__header(fout)
+            f_err.write("dw_res dv_res dw_0 dv_0\n")
             with torch.no_grad():
-                for i, data in enumerate(testloader):
-                    p0, p1, igt = data  # igt: p0->p1
-                    # # compute trans from p1->p0
-                    # g = se3.log(igt)  # --> [-1, 6]
-                    # igt = se3.exp(-g)  # [-1, 4, 4]
-                    p0, p1 = self.ablation_study(p0, p1)
+                # for i, data in enumerate(testloader):
+                for i, data in enumerate(tqdm(testloader)):
+                    if isinstance(data, dict):
+                        p0 = data['inputs_est']
+                        p1 = data['inputs_2']
 
+                        scale = max(p0.max() - p0.min(), p1.max() - p1.min())
+                        p0 = p0 / scale
+                        p1 = p1 / scale
+                        
+                        igt_raw = data['T21']
+                        igt_init_raw = data['T21_est']
+                        igt_raw = torch.matmul(igt_raw, igt_init_raw.transpose(-1, -2))
+                        
+                        igt = torch.eye(4).unsqueeze(0)
+                        igt[:, :3, :3] = igt_raw #.transpose(-1, -2)
+
+                    elif isinstance(data, list):
+                        p0, p1, igt = data  # igt: p0->p1
+                    else:
+                        raise ValueError("Not recognized data type {}".format(type(data)))
+                    
+                    # print("p0", p0.shape, p0.max(), p0.min())
+                    # print("p1", p1.shape, p1.max(), p1.min())
+
+                    # ### visualize
+                    # print(p0.shape)
+                    # visualize_pointcloud(p0.cpu().numpy()[0], points2=p1.cpu().numpy()[0], show=True, s1=1)
+                    # category_name = testloader.dataset.models[data['idx'][0]]['category']
+                    # if category_name == 'airplane':
+                    #     model_name = testloader.dataset.models[data['idx'][0]]['model']
+                    #     print(model_name)
+                    #     print(p0.shape)
+                    #     visualize_pointcloud(p0.cpu().numpy()[0], points2=p1.cpu().numpy()[0], show=True, s1=1)
+
+                    ### ground truth
+                    dx0 = se3.log(igt)  # --> [1, 6]
+                    dw0 = dx0[:, :3].norm(p=2, dim=1)  # --> [1]
+                    dv0 = dx0[:, 3:].norm(p=2, dim=1)  # --> [1]
+                    dw0 = dw0.item() / np.pi * 180
+                    dv0 = dv0.item()
+
+                    ### estimation
                     p0 = p0.to(device)  # template (1, N, 3)
                     p1 = p1.to(device)  # source (1, M, 3)
                     solver.estimate_t(p0, p1, self.max_iter)
-
-                    est_g = solver.g  # (1, 4, 4)
+                    est_g = solver.g  # (1, 4, 4)   (p1->p0)
 
                     ig_gt = igt.cpu().contiguous().view(-1, 4, 4)  # --> [1, 4, 4]
                     g_hat = est_g.cpu().contiguous().view(-1, 4, 4)  # --> [1, 4, 4]
+                    self.eval_1__write(fout, ig_gt, g_hat)
 
+                    ### residual
                     dg = g_hat.bmm(ig_gt)  # if correct, dg == identity matrix.
                     dx = se3.log(dg)  # --> [1, 6] (if corerct, dx == zero vector)
                     dn = dx.norm(p=2, dim=1)  # --> [1]
                     dm = dn.mean()
+                    dw = dx[:, :3].norm(p=2, dim=1)  # --> [1]
+                    dv = dx[:, 3:].norm(p=2, dim=1)  # --> [1]
+                    dw = dw.item() / np.pi * 180
+                    dv = dv.item()
 
-                    self.eval_1__write(fout, ig_gt, g_hat)
-                    print('test, %d/%d, %f' % (i, len(testloader), dm))
+                    if (not np.isnan(dw)) and (not np.isnan(dv)):
+                        metric_dict = dict(angle=dw, trans=dv)
+                        metric_tracker.update(metric_dict)
+                    f_err.write("{:.4f} {:.4f} {:.4f} {:.4f}\n".format(dw, dv, dw0, dv0)) 
+
+        
+            f_err.close()
+            ### metric summary:
+            avg_d = metric_tracker.summary()
+            print("=================================================")
+            for k in avg_d:
+                print(k, avg_d[k])   
+            with open(self.filename[:-4]+"_metric.txt", "w") as f:
+                f.write("{:.4f} {:.4f} {:.4f} {:.4f} {:.4f}".format(avg_d['angle'], avg_d['trans'], avg_d['angle_180'], avg_d['num_90-'], avg_d['num_90+']))
 
 
-    def ablation_study(self, p0, p1, add_noise=False, add_density=False):
-        # ablation study
-        # mesh = self.plyread("./box1Kinect1.ply")
-        # p0 = torch.tensor(mesh).to(device).unsqueeze(0)
-        # mesh = self.plyread("./box11.ply")
-        # p1 = torch.tensor(mesh).to(device).unsqueeze(0)
-
-        # add noise
-        if add_noise:
-            p1 = torch.tensor(np.float32(np.random.normal(p1, 0.01)))
-
-        # add outliers
-        if add_density:
-            density_ratio = 0.5
-            pts_num = p1.shape[0]
-            sampleNum = int(pts_num * density_ratio)  # the number of remaining points
-            if pts_num > sampleNum:
-                num = sample(range(1, pts_num), sampleNum)
-            elif pts_num > 0:
-                num = range(0, pts_num)
-            else:
-                print("No points in this point cloud!")
-                return
-            p1 = p1[num, :]
-        return p0, p1
 
     def eval_1__header(self, fout):
         cols = ['h_w1', 'h_w2', 'h_w3', 'h_v1', 'h_v2', 'h_v3', \
@@ -497,8 +658,8 @@ class FMRTest:
         fout.flush()
 
     def eval_1__write(self, fout, ig_gt, g_hat):
-        x_hat = se3.log(g_hat)  # --> [-1, 6]
-        mx_gt = se3.log(ig_gt)  # --> [-1, 6]
+        x_hat = se3.log(g_hat)  # --> [-1, 6]   estimation   p1->p0
+        mx_gt = se3.log(ig_gt)  # --> [-1, 6]   ground truth p0->p1
         for i in range(x_hat.size(0)):
             x_hat1 = x_hat[i]  # [6]
             mx_gt1 = mx_gt[i]  # [6]

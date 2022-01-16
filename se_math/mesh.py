@@ -107,7 +107,7 @@ class Mesh:
         self._vertices = list(map(tuple, v))
         return self
 
-def offread_uniformed(filepath, sampled_pt_num=1024):
+def offread_uniformed(filepath, sampled_pt_num=10000):
     """ read OFF mesh file and uniformly sample points on the mesh. """
     mesh = Mesh()
     input = o3d.io.read_triangle_mesh(filepath)

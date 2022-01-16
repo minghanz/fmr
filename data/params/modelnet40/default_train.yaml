@@ -1,0 +1,6 @@
+num_points: 2048
+mag_deg: 45
+random_deg: true
+mag_trans: 0.5
+random_trans: true
+uniformsampling: false

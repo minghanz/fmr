@@ -12,14 +12,14 @@ import torch
 import torch.utils.data
 import torchvision
 
-sys.path.append('../')
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 
 from se_math import se3
 from se_math import so3
 from se_math import transforms
 import dataset
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
+# sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
 
 
 def options(argv=None):
@@ -55,9 +55,9 @@ def main(args):
     batch_size = len(testset)
 
     amp = args.deg * math.pi / 180.0
-    w = torch.randn(batch_size, 3)
-    w = w / w.norm(p=2, dim=1, keepdim=True) * amp
-    t = torch.rand(batch_size, 3) * args.max_trans
+    w = torch.randn(batch_size, 3)                      # random axis
+    w = w / w.norm(p=2, dim=1, keepdim=True) * amp      # fixed amplitude
+    t = torch.rand(batch_size, 3) * args.max_trans      # a cube
 
     if args.format == 'wv':
         # the output: twist vectors.

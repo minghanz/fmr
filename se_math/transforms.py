@@ -7,6 +7,7 @@ import torch.utils.data
 from . import so3
 from . import se3
 
+import numpy as np
 
 class Mesh2Points:
     def __init__(self):
@@ -17,6 +18,8 @@ class Mesh2Points:
         v = mesh.vertex_array
         return torch.from_numpy(v).type(dtype=torch.float)
 
+    def __repr__(self):
+        return f"{self.__class__.__name__}()"
 
 class OnUnitSphere:
     def __init__(self, zero_mean=False):
@@ -32,12 +35,15 @@ class OnUnitSphere:
         nmax = torch.max(nn)
         return v / nmax
 
+    def __repr__(self):
+        return f"{self.__class__.__name__}(zero_mean={self.zero_mean})"
 
 class OnUnitCube:
     def __init__(self):
         pass
 
     def method1(self, tensor):
+        ### normalize the max absolute value to 0.5
         m = tensor.mean(dim=0, keepdim=True)  # [N, D] -> [1, D]
         v = tensor - m
         s = torch.max(v.abs())
@@ -45,6 +51,7 @@ class OnUnitCube:
         return v
 
     def method2(self, tensor):
+        ### normalize the max dimension to 1
         c = torch.max(tensor, dim=0)[0] - torch.min(tensor, dim=0)[0]  # [N, D] -> [D]
         s = torch.max(c)  # -> scalar
         v = tensor / s
@@ -54,9 +61,13 @@ class OnUnitCube:
         # return self.method1(tensor)
         return self.method2(tensor)
 
+    def __repr__(self):
+        return f"{self.__class__.__name__}()"
 
 class Resampler:
-    """ [N, D] -> [M, D] """
+    """ [N, D] -> [M, D] 
+    When the number of wanted points is larger than the number of input points, 
+    Duplicated points will be sampled. """
 
     def __init__(self, num):
         self.num = num
@@ -75,6 +86,8 @@ class Resampler:
             selected += sel
         return out
 
+    def __repr__(self):
+        return f"{self.__class__.__name__}(num={self.num})"
 
 class RandomTranslate:
     def __init__(self, mag=None, randomly=True):
@@ -95,6 +108,8 @@ class RandomTranslate:
         p1 = tensor + t
         return p1
 
+    def __repr__(self):
+        return f"{self.__class__.__name__}(mag={self.mag}, randomly={self.randomly})"
 
 class RandomRotator:
     def __init__(self, mag=None, randomly=True):
@@ -114,6 +129,8 @@ class RandomRotator:
         p1 = so3.transform(g, tensor)  # [1, 3, 3] x [N, 3] -> [N, 3]
         return p1
 
+    def __repr__(self):
+        return f"{self.__class__.__name__}(mag={self.mag}, randomly={self.randomly})"
 
 class RandomRotatorZ:
     def __init__(self):
@@ -128,6 +145,8 @@ class RandomRotatorZ:
         p1 = so3.transform(g, tensor)
         return p1
 
+    def __repr__(self):
+        return f"{self.__class__.__name__}()"
 
 class RandomJitter:
     """ generate perturbations """
@@ -147,24 +166,41 @@ class RandomJitter:
     def __call__(self, tensor):
         return self.jitter(tensor)
 
+    def __repr__(self):
+        return f"{self.__class__.__name__}(scale={self.scale}, clip={self.clip})"
 
 class RandomTransformSE3:
     """ rigid motion """
 
-    def __init__(self, mag=1, mag_randomly=False):
-        self.mag = mag
-        self.randomly = mag_randomly
+    def __init__(self, mag_deg=1, mag_trans=1, randomly_deg=False, randomly_trans=False):
+        """Note that the mag_trans is not exactly the magnitude of translation, but the magnitude of the geodesic translation because of the exponential map. 
+        See https://ingmec.ual.es/~jlblanco/papers/jlblanco2010geometry3D_techrep.pdf 9.4.2 (p47)"""
+        self.mag_deg = mag_deg * np.pi / 180        # Minghan: use deg as input!
+        self.mag_trans = mag_trans
+        self.randomly_deg = randomly_deg
+        self.randomly_trans = randomly_trans
 
         self.gt = None
         self.igt = None
 
     def generate_transform(self):
         # return: a twist-vector
-        amp = self.mag
-        if self.randomly:
-            amp = torch.rand(1, 1) * self.mag
-        x = torch.randn(1, 6)
+        amp = self.mag_deg
+        if self.randomly_deg:
+            amp = torch.rand(1, 1) * self.mag_deg
+        x = torch.randn(1, 3)
         x = x / x.norm(p=2, dim=1, keepdim=True) * amp
+
+        amp = self.mag_trans
+        if self.randomly_trans:
+            amp = torch.rand(1, 1) * self.mag_trans
+        y = torch.randn(1, 3)
+        y = y / y.norm(p=2, dim=1, keepdim=True) * amp
+
+        x = torch.cat([x, y], dim=1)
+
+        # x = torch.randn(1, 6)
+        # x = x / x.norm(p=2, dim=1, keepdim=True) * amp
 
         '''a = torch.rand(3)
         a = a * math.pi
@@ -191,5 +227,8 @@ class RandomTransformSE3:
 
     def __call__(self, tensor):
         return self.transform(tensor)
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(mag_deg={self.mag_deg}, mag_trans={self.mag_trans}, randomly_deg={self.randomly_deg}, randomly_trans={self.randomly_trans})"
 
 # EOF

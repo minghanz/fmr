@@ -1,0 +1,9 @@
+shared:
+  - Mesh2Points()
+  - OnUnitCube()
+  - Resampler(params['num_points'])
+  - RandomRotator()
+source:
+  - RandomJitter()
+target:
+  - RandomJitter()

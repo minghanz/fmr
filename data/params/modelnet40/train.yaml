@@ -1,0 +1,7 @@
+num_points: 1024
+mag_deg: 45
+random_deg: true
+mag_trans: 0.8
+random_trans: true
+uniformsampling: true
+density_ratio: 0.5
